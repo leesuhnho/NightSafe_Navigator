@@ -4,7 +4,11 @@
   "description": "서울시 공공데이터 기반 야간 귀가 안전 경로 추천 서비스. 공식 안심귀갓길과 안전시설을 우선하고, 좁고 외진 골목에 패널티를 부여하는 하이브리드 AI 경로 탐색 시스템입니다.",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "collect:public-data:list": "node scripts/ingestion/run.mjs list",
+    "collect:public-data": "node scripts/ingestion/run.mjs collect all",
+    "collect:public-data:dry-run": "node scripts/ingestion/run.mjs collect all --dry-run",
+    "geocode:police": "node scripts/ingestion/geocode-police.mjs",
+    "test": "node test/ingestion-utils.test.mjs"
   },
   "author": "sunho",
   "license": "MIT"

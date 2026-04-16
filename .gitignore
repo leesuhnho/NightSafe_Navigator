@@ -1,1 +1,7 @@
 node_modules/
+.tmp-tests/
+data/raw/
+data/derived/
+data/raw-debug/
+test/.tmp-*/
+test/review-dryrun/
