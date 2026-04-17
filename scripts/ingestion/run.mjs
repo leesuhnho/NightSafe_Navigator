@@ -3,13 +3,22 @@ import process from 'node:process';
 
 import { SOURCE_CATALOG, getSourceById, resolveSourceIds } from './catalog.mjs';
 import { collectSource } from './lib/collectors.mjs';
+import { formatErrorChain } from './lib/debug-utils.mjs';
 import { loadProjectEnv } from './lib/env-utils.mjs';
 
 function parseArgs(argv) {
   const positional = [];
   const flags = {
     dryRun: false,
+    debug: false,
+    debugRoot: path.resolve('02_debug'),
     outputRoot: path.resolve('data', 'raw'),
+    requestTimeoutMs: 30000,
+    downloadStartTimeoutMs: 30000,
+    downloadIdleTimeoutMs: 120000,
+    downloadMaxDurationMs: null,
+    networkRetryCount: 4,
+    networkRetryBaseMs: 1000,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -20,8 +29,92 @@ function parseArgs(argv) {
       continue;
     }
 
+    if (token === '--debug') {
+      flags.debug = true;
+      continue;
+    }
+
+    if (token === '--debug-root') {
+      flags.debugRoot = path.resolve(argv[index + 1]);
+      index += 1;
+      continue;
+    }
+
     if (token === '--output-root') {
       flags.outputRoot = path.resolve(argv[index + 1]);
+      index += 1;
+      continue;
+    }
+
+    if (token === '--request-timeout-ms') {
+      const timeoutValue = Number(argv[index + 1]);
+      if (!Number.isFinite(timeoutValue) || timeoutValue <= 0) {
+        throw new Error('--request-timeout-ms expects a positive number.');
+      }
+
+      flags.requestTimeoutMs = timeoutValue;
+      index += 1;
+      continue;
+    }
+
+    if (token === '--download-start-timeout-ms') {
+      const timeoutValue = Number(argv[index + 1]);
+      if (!Number.isFinite(timeoutValue) || timeoutValue <= 0) {
+        throw new Error('--download-start-timeout-ms expects a positive number.');
+      }
+
+      flags.downloadStartTimeoutMs = timeoutValue;
+      index += 1;
+      continue;
+    }
+
+    if (token === '--download-idle-timeout-ms') {
+      const timeoutValue = Number(argv[index + 1]);
+      if (!Number.isFinite(timeoutValue) || timeoutValue <= 0) {
+        throw new Error('--download-idle-timeout-ms expects a positive number.');
+      }
+
+      flags.downloadIdleTimeoutMs = timeoutValue;
+      index += 1;
+      continue;
+    }
+
+    if (token === '--download-max-duration-ms') {
+      const rawValue = argv[index + 1];
+      if (rawValue === '0' || /^off$/i.test(rawValue) || /^none$/i.test(rawValue)) {
+        flags.downloadMaxDurationMs = null;
+        index += 1;
+        continue;
+      }
+
+      const timeoutValue = Number(rawValue);
+      if (!Number.isFinite(timeoutValue) || timeoutValue <= 0) {
+        throw new Error('--download-max-duration-ms expects a positive number, 0, "off", or "none".');
+      }
+
+      flags.downloadMaxDurationMs = timeoutValue;
+      index += 1;
+      continue;
+    }
+
+    if (token === '--network-retry-count') {
+      const retryCount = Number(argv[index + 1]);
+      if (!Number.isInteger(retryCount) || retryCount < 0) {
+        throw new Error('--network-retry-count expects a non-negative integer.');
+      }
+
+      flags.networkRetryCount = retryCount;
+      index += 1;
+      continue;
+    }
+
+    if (token === '--network-retry-base-ms') {
+      const retryBaseMs = Number(argv[index + 1]);
+      if (!Number.isFinite(retryBaseMs) || retryBaseMs <= 0) {
+        throw new Error('--network-retry-base-ms expects a positive number.');
+      }
+
+      flags.networkRetryBaseMs = retryBaseMs;
       index += 1;
       continue;
     }
@@ -35,8 +128,8 @@ function parseArgs(argv) {
 function printHelp() {
   console.log(`Usage:
   node scripts/ingestion/run.mjs list
-  node scripts/ingestion/run.mjs collect all [--dry-run] [--output-root data/raw]
-  node scripts/ingestion/run.mjs collect walk-network safe-route bus-stop
+  node scripts/ingestion/run.mjs collect all [--dry-run] [--debug] [--debug-root 02_debug] [--request-timeout-ms 30000] [--download-start-timeout-ms 30000] [--download-idle-timeout-ms 120000] [--download-max-duration-ms off] [--network-retry-count 4] [--network-retry-base-ms 1000] [--output-root data/raw]
+  node scripts/ingestion/run.mjs collect walk-network safe-route bus-stop [--debug]
 `);
 }
 
@@ -103,6 +196,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(error.message);
+  console.error(formatErrorChain(error, { includeStack: process.argv.includes('--debug') }));
   process.exitCode = 1;
 });

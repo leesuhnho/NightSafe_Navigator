@@ -1,7 +1,9 @@
 node_modules/
 .tmp-tests/
+.tmp-inspect-*/
 data/raw/
 data/derived/
+data/processed/
 data/raw-debug/
 test/.tmp-*/
 test/review-dryrun/

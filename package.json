@@ -7,8 +7,12 @@
     "collect:public-data:list": "node scripts/ingestion/run.mjs list",
     "collect:public-data": "node scripts/ingestion/run.mjs collect all",
     "collect:public-data:dry-run": "node scripts/ingestion/run.mjs collect all --dry-run",
+    "collect:public-data:debug": "node scripts/ingestion/run.mjs collect all --debug",
+    "collect:population-hourly:debug": "node scripts/ingestion/run.mjs collect population-hourly --debug",
+    "refine:list": "node scripts/refinement/run.mjs list",
+    "refine": "node scripts/refinement/run.mjs refine all",
     "geocode:police": "node scripts/ingestion/geocode-police.mjs",
-    "test": "node test/ingestion-utils.test.mjs"
+    "test": "node test/run-all.mjs"
   },
   "author": "sunho",
   "license": "MIT"

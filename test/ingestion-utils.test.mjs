@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import net from 'node:net';
@@ -41,6 +42,14 @@ function createInvalidContentLengthError() {
   return error;
 }
 
+function createConnectionResetError() {
+  const error = new TypeError('fetch failed');
+  error.cause = Object.assign(new Error('read ECONNRESET'), {
+    code: 'ECONNRESET',
+  });
+  return error;
+}
+
 async function createRawHttpServer(responseBody, extraHeaders = []) {
   const bodyBuffer = Buffer.isBuffer(responseBody) ? responseBody : Buffer.from(responseBody);
   const server = net.createServer((socket) => {
@@ -64,6 +73,115 @@ async function createRawHttpServer(responseBody, extraHeaders = []) {
 
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   return server;
+}
+
+async function createRawStreamingHttpServer({
+  responseChunks = [],
+  extraHeaders = [],
+  initialDelayMs = 0,
+  betweenChunksDelayMs = 0,
+}) {
+  const normalizedChunks = responseChunks.map((chunk) =>
+    Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk),
+  );
+  const totalLength = normalizedChunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const server = net.createServer((socket) => {
+    socket.once('data', () => {
+      const headers = [
+        'HTTP/1.1 200 OK',
+        `Content-Length: ${totalLength}`,
+        'Content-Type: application/octet-stream',
+        'Connection: close',
+        ...extraHeaders,
+        '',
+        '',
+      ].join('\r\n');
+
+      socket.write(headers);
+
+      const sendChunk = (index) => {
+        if (index >= normalizedChunks.length) {
+          socket.end();
+          return;
+        }
+
+        socket.write(normalizedChunks[index]);
+        setTimeout(() => sendChunk(index + 1), betweenChunksDelayMs);
+      };
+
+      setTimeout(() => sendChunk(0), initialDelayMs);
+    });
+  });
+
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return server;
+}
+
+async function createStreamingDownloadServer({
+  pageHtml = null,
+  downloadChunks = [],
+  downloadHeaders = {},
+  initialDelayMs = 0,
+  betweenChunksDelayMs = 0,
+}) {
+  const normalizedChunks = downloadChunks.map((chunk) =>
+    Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk),
+  );
+  const server = http.createServer((request, response) => {
+    response.on('error', () => {
+      // Ignore client disconnects from timeout/abort tests.
+    });
+
+    if (request.url === '/dataset' && pageHtml !== null) {
+      response.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+      });
+      response.end(pageHtml);
+      return;
+    }
+
+    if (request.url === '/download') {
+      request.resume();
+      response.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        ...downloadHeaders,
+      });
+      response.flushHeaders?.();
+
+      const sendChunk = (index) => {
+        if (index >= normalizedChunks.length) {
+          response.end();
+          return;
+        }
+
+        response.write(normalizedChunks[index]);
+        const nextDelayMs = index === 0 ? betweenChunksDelayMs : betweenChunksDelayMs;
+        setTimeout(() => sendChunk(index + 1), nextDelayMs);
+      };
+
+      setTimeout(() => sendChunk(0), initialDelayMs);
+      return;
+    }
+
+    response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+    response.end('not found');
+  });
+
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return server;
+}
+
+async function closeServer(server) {
+  await new Promise((resolve, reject) =>
+    server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve();
+    }),
+  );
 }
 
 const tempDirs = new Set();
@@ -195,53 +313,200 @@ await runAsync('downloadToFile falls back to legacy HTTP client on duplicate Con
     assert.equal(result.headers['content-disposition'], 'attachment; filename="localdata.xml"');
   } finally {
     global.fetch = originalFetch;
-    await new Promise((resolve, reject) =>
-      server.close((error) => {
-        if (error) {
-          reject(error);
-          return;
-        }
+    await closeServer(server);
+  }
+});
 
-        resolve();
+await runAsync('downloadToFile supports slow streaming downloads without an overall timeout', async () => {
+  const outputDir = uniqueTempDir('.tmp-http-utils-streaming-success');
+  const server = await createStreamingDownloadServer({
+    downloadChunks: ['alpha', 'beta', 'gamma'],
+    downloadHeaders: {
+      'content-disposition': 'attachment; filename="slow-stream.bin"',
+    },
+    initialDelayMs: 40,
+    betweenChunksDelayMs: 40,
+  });
+  const address = server.address();
+
+  try {
+    const result = await downloadToFile({
+      url: `http://127.0.0.1:${address.port}/download`,
+      outputDir,
+      suggestedName: 'slow-stream.bin',
+      timeoutOptions: {
+        startTimeoutMs: 50,
+        idleTimeoutMs: 80,
+        maxDurationMs: null,
+      },
+    });
+
+    const saved = await fs.readFile(result.filePath, 'utf8');
+    assert.equal(saved, 'alphabetagamma');
+    assert.equal(result.size, Buffer.byteLength('alphabetagamma'));
+  } finally {
+    await closeServer(server);
+  }
+});
+
+await runAsync('downloadToFile fails on idle timeout while streaming', async () => {
+  const outputDir = uniqueTempDir('.tmp-http-utils-streaming-timeout');
+  const server = await createRawStreamingHttpServer({
+    responseChunks: ['alpha', 'beta'],
+    extraHeaders: [
+      'Content-Disposition: attachment; filename="idle-timeout.bin"',
+    ],
+    initialDelayMs: 0,
+    betweenChunksDelayMs: 250,
+  });
+  const address = server.address();
+
+  try {
+    await assert.rejects(
+      downloadToFile({
+        url: `http://127.0.0.1:${address.port}/download`,
+        outputDir,
+        suggestedName: 'idle-timeout.bin',
+        timeoutOptions: {
+          startTimeoutMs: 50,
+          idleTimeoutMs: 60,
+          maxDurationMs: null,
+        },
       }),
+      (error) => {
+        assert.equal(error.code, 'ETIMEDOUT');
+        assert.match(error.message, /first download byte|idle/i);
+        return true;
+      },
     );
+  } finally {
+    await closeServer(server);
+  }
+});
+
+await runAsync('collectSource page-download uses separate download timeout settings for slow streams', async () => {
+  const outputRoot = uniqueTempDir('.tmp-page-download-streaming-success');
+  const pageHtml = `
+    <html>
+      <body>
+        <script>
+          document.frmFile.action = "/download";
+        </script>
+        <form name="frmFile">
+          <input type="hidden" name="infId" value="OA-DEMO" />
+          <input type="hidden" name="seqNo" value="" />
+          <input type="hidden" name="infSeq" value="1" />
+        </form>
+        <a href="javascript:downloadFile('2603');">LOCAL_PEOPLE_202603.zip download</a>
+      </body>
+    </html>
+  `;
+  const server = await createStreamingDownloadServer({
+    pageHtml,
+    downloadChunks: ['alpha', 'beta', 'gamma'],
+    downloadHeaders: {
+      'content-disposition': 'attachment; filename="LOCAL_PEOPLE_202603.zip"',
+    },
+    initialDelayMs: 40,
+    betweenChunksDelayMs: 40,
+  });
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  try {
+    const manifest = await collectSource(
+      {
+        id: 'demo-page-download-streaming',
+        title: 'Demo Page Download Streaming',
+        provider: 'Test',
+        strategy: {
+          type: 'page-download',
+          pageUrl: `${baseUrl}/dataset`,
+          selectors: [
+            {
+              label: 'population-hourly-monthly-zip',
+              include: ['LOCAL_PEOPLE_', '.zip'],
+              pick: 'latest',
+            },
+          ],
+        },
+        legal: {
+          summary: 'test',
+          license: 'test',
+          notes: [],
+          sources: [],
+        },
+      },
+      {
+        outputRoot,
+        dryRun: false,
+        requestTimeoutMs: 50,
+        downloadStartTimeoutMs: 50,
+        downloadIdleTimeoutMs: 80,
+        downloadMaxDurationMs: null,
+        networkRetryCount: 0,
+        networkRetryBaseMs: 1,
+      },
+    );
+
+    assert.equal(manifest.downloads.length, 1);
+    const saved = await fs.readFile(manifest.downloads[0].filePath, 'utf8');
+    assert.equal(saved, 'alphabetagamma');
+    assert.equal(path.basename(manifest.downloads[0].filePath), 'LOCAL_PEOPLE_202603.zip');
+  } finally {
+    await closeServer(server);
   }
 });
 
 await runAsync('collectSource falls back when open-api URL is not configured', async () => {
   const outputRoot = uniqueTempDir('.tmp-collectors');
-  const manifest = await collectSource(
-    {
-      id: 'demo-open-api',
-      title: 'Demo Open API',
-      provider: 'Test',
-      strategy: {
-        type: 'open-api',
-        urlEnvPath: 'SAFE_ROUTE_DEMO_OPEN_API_URL',
-        fallback: {
-          type: 'manual',
-          envPath: 'SAFE_ROUTE_DEMO_MANUAL_PATH',
-          expectedPatterns: ['*.json'],
+  const manualSourceDir = uniqueTempDir('.tmp-fallback-manual-source');
+  const manualSourcePath = path.join(manualSourceDir, 'fallback.json');
+  const originalManualPath = process.env.SAFE_ROUTE_DEMO_MANUAL_PATH;
+
+  await fs.writeFile(manualSourcePath, '{"ok":true}');
+  process.env.SAFE_ROUTE_DEMO_MANUAL_PATH = manualSourcePath;
+
+  try {
+    const manifest = await collectSource(
+      {
+        id: 'demo-open-api',
+        title: 'Demo Open API',
+        provider: 'Test',
+        strategy: {
+          type: 'open-api',
+          urlEnvPath: 'SAFE_ROUTE_DEMO_OPEN_API_URL',
+          fallback: {
+            type: 'manual',
+            envPath: 'SAFE_ROUTE_DEMO_MANUAL_PATH',
+            expectedPatterns: ['*.json'],
+          },
+        },
+        legal: {
+          summary: 'test',
+          license: 'test',
+          notes: [],
+          sources: [],
         },
       },
-      legal: {
-        summary: 'test',
-        license: 'test',
-        notes: [],
-        sources: [],
+      {
+        outputRoot,
+        dryRun: false,
       },
-    },
-    {
-      outputRoot,
-      dryRun: false,
-    },
-  );
+    );
 
-  assert.equal(manifest.requestedStrategy, 'open-api');
-  assert.equal(manifest.strategyUsed, 'manual');
-  assert.equal(manifest.strategy, 'manual');
-  assert.match(manifest.warnings[0], /Open API URL is not configured/i);
-  assert.match(manifest.warnings[1], /SAFE_ROUTE_DEMO_MANUAL_PATH/i);
+    assert.equal(manifest.requestedStrategy, 'open-api');
+    assert.equal(manifest.strategyUsed, 'manual');
+    assert.equal(manifest.strategy, 'manual');
+    assert.match(manifest.warnings[0], /Open API URL is not configured/i);
+    assert.equal(manifest.manualSourcePath, manualSourcePath);
+  } finally {
+    if (typeof originalManualPath === 'string') {
+      process.env.SAFE_ROUTE_DEMO_MANUAL_PATH = originalManualPath;
+    } else {
+      delete process.env.SAFE_ROUTE_DEMO_MANUAL_PATH;
+    }
+  }
 });
 
 await runAsync('collectSource manual strategy does not copy files during dry-run', async () => {
@@ -290,6 +555,45 @@ await runAsync('collectSource manual strategy does not copy files during dry-run
   }
 });
 
+await runAsync('collectSource manual strategy fails immediately when source is missing', async () => {
+  const outputRoot = uniqueTempDir('.tmp-manual-missing');
+  const originalManualPath = process.env.SAFE_ROUTE_DEMO_MANUAL_MISSING_PATH;
+
+  delete process.env.SAFE_ROUTE_DEMO_MANUAL_MISSING_PATH;
+
+  try {
+    await assert.rejects(
+      collectSource(
+        {
+          id: 'demo-manual-missing',
+          title: 'Demo Manual Missing',
+          provider: 'Test',
+          strategy: {
+            type: 'manual',
+            envPath: 'SAFE_ROUTE_DEMO_MANUAL_MISSING_PATH',
+            expectedPatterns: ['*.zip'],
+          },
+          legal: {
+            summary: 'test',
+            license: 'test',
+            notes: [],
+            sources: [],
+          },
+        },
+        {
+          outputRoot,
+          dryRun: false,
+        },
+      ),
+      /SAFE_ROUTE_DEMO_MANUAL_MISSING_PATH/i,
+    );
+  } finally {
+    if (typeof originalManualPath === 'string') {
+      process.env.SAFE_ROUTE_DEMO_MANUAL_MISSING_PATH = originalManualPath;
+    }
+  }
+});
+
 await runAsync('loadProjectEnv reads .env.local after .env without clobbering existing env', async () => {
   const projectRoot = uniqueTempDir('.tmp-env-loader');
   const originalSeoulApiKey = process.env.SEOUL_OPEN_API_KEY;
@@ -333,6 +637,119 @@ await runAsync('loadProjectEnv reads .env.local after .env without clobbering ex
     } else {
       delete process.env.DEMO_QUOTED_VALUE;
     }
+  }
+});
+
+await runAsync('collectSource page-download retries network failures up to the configured limit', async () => {
+  const originalFetch = global.fetch;
+  const outputRoot = uniqueTempDir('.tmp-page-download-failure');
+  let attempts = 0;
+
+  global.fetch = async () => {
+    attempts += 1;
+    throw createConnectionResetError();
+  };
+
+  try {
+    await assert.rejects(
+      collectSource(
+        {
+          id: 'demo-page-download',
+          title: 'Demo Page Download',
+          provider: 'Test',
+          strategy: {
+            type: 'page-download',
+            pageUrl: 'https://example.com/dataset',
+            selectors: [
+              {
+                label: 'demo-file',
+                include: ['다운로드'],
+                pick: 'latest',
+              },
+            ],
+          },
+          legal: {
+            summary: 'test',
+            license: 'test',
+            notes: [],
+            sources: [],
+          },
+        },
+        {
+          outputRoot,
+          dryRun: false,
+          requestTimeoutMs: 2000,
+          networkRetryCount: 1,
+          networkRetryBaseMs: 1,
+        },
+      ),
+      /fetch failed/i,
+    );
+    assert.equal(attempts, 2);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+await runAsync('collectSource page-download writes debug session files for failures', async () => {
+  const originalFetch = global.fetch;
+  const outputRoot = uniqueTempDir('.tmp-page-download-debug-output');
+  const debugRoot = uniqueTempDir('.tmp-page-download-debug-root');
+
+  global.fetch = async () => {
+    throw createConnectionResetError();
+  };
+
+  try {
+    await assert.rejects(
+      collectSource(
+        {
+          id: 'demo-page-download-debug',
+          title: 'Demo Page Download Debug',
+          provider: 'Test',
+          strategy: {
+            type: 'page-download',
+            pageUrl: 'https://example.com/dataset',
+            selectors: [
+              {
+                label: 'demo-file',
+                include: ['다운로드'],
+                pick: 'latest',
+              },
+            ],
+          },
+          legal: {
+            summary: 'test',
+            license: 'test',
+            notes: [],
+            sources: [],
+          },
+        },
+        {
+          outputRoot,
+          debug: true,
+          debugRoot,
+          dryRun: false,
+          requestTimeoutMs: 2000,
+          networkRetryCount: 1,
+          networkRetryBaseMs: 1,
+        },
+      ),
+      /fetch failed/i,
+    );
+
+    const debugSourceDir = path.join(debugRoot, 'demo-page-download-debug');
+    const [runId] = await fs.readdir(debugSourceDir);
+    const meta = JSON.parse(await fs.readFile(path.join(debugSourceDir, runId, 'meta.json'), 'utf8'));
+    const logText = await fs.readFile(path.join(debugSourceDir, runId, 'debug.log'), 'utf8');
+
+    assert.equal(meta.status, 'failed');
+    assert.equal(meta.failure.errorChain[1].code, 'ECONNRESET');
+    assert.match(logText, /retrying page https:\/\/example\.com\/dataset/);
+    assert.match(logText, /debug session failed/);
+    assert.match(logText, /fetch\.request\.start/);
+  } finally {
+    global.fetch = originalFetch;
   }
 });
 
@@ -425,6 +842,7 @@ await runAsync('collectSource collects 서울 열린데이터광장 Open API ser
       {
         outputRoot,
         dryRun: false,
+        requestTimeoutMs: 5000,
       },
     );
 
@@ -435,6 +853,102 @@ await runAsync('collectSource collects 서울 열린데이터광장 Open API ser
     const payload = JSON.parse(await fs.readFile(manifest.requests[0].filePath, 'utf8'));
     assert.equal(payload.serviceName, 'LOCALDATA_DEMO');
     assert.deepEqual(payload.rows, [{ id: 1 }, { id: 2 }]);
+
+    const progressPath = path.join(outputRoot, 'demo-seoul-open-api', manifest.runId, 'OA-DEMO-LOCALDATA_DEMO.progress.json');
+    const progress = JSON.parse(await fs.readFile(progressPath, 'utf8'));
+    assert.equal(progress.done, true);
+    assert.equal(progress.rowsCollected, 2);
+    assert.equal(progress.totalCount, 2);
+    assert.equal('debugLogPath' in progress, false);
+    assert.equal('debugDir' in progress, false);
+  } finally {
+    global.fetch = originalFetch;
+
+    if (typeof originalKey === 'string') {
+      process.env.SEOUL_OPEN_API_KEY = originalKey;
+    } else {
+      delete process.env.SEOUL_OPEN_API_KEY;
+    }
+  }
+});
+
+await runAsync('collectSource writes debug session files for Seoul Open API series', async () => {
+  const originalFetch = global.fetch;
+  const originalKey = process.env.SEOUL_OPEN_API_KEY;
+  const outputRoot = uniqueTempDir('.tmp-seoul-open-api-debug-output');
+  const debugRoot = uniqueTempDir('.tmp-seoul-open-api-debug-root');
+
+  process.env.SEOUL_OPEN_API_KEY = 'demo-key';
+
+  global.fetch = async (url) => {
+    const normalizedUrl = String(url);
+
+    if (normalizedUrl === 'https://data.seoul.go.kr/dataList/openApiView.do?infId=OA-DEMO&srvType=A') {
+      return new Response(`
+        <script>var svcNm = 'LOCALDATA_DEMO';</script>
+        <a href="http://openapi.seoul.go.kr:8088/sample/xml/LOCALDATA_DEMO/1/5/"></a>
+      `, {
+        status: 200,
+        headers: { 'content-type': 'text/html; charset=utf-8' },
+      });
+    }
+
+    if (normalizedUrl === 'http://openapi.seoul.go.kr:8088/demo-key/json/LOCALDATA_DEMO/1/1000/') {
+      return new Response(JSON.stringify({
+        LOCALDATA_DEMO: {
+          list_total_count: 2,
+          RESULT: { CODE: 'INFO-000', MESSAGE: 'OK' },
+          row: [{ id: 1 }, { id: 2 }],
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    throw new Error(`Unexpected fetch URL: ${normalizedUrl}`);
+  };
+
+  try {
+    const manifest = await collectSource(
+      {
+        id: 'demo-seoul-open-api-debug',
+        title: 'Demo Seoul Open API Debug',
+        provider: 'Test',
+        strategy: {
+          type: 'seoul-open-api-series',
+          keyEnvPath: 'SEOUL_OPEN_API_KEY',
+          infIds: ['OA-DEMO'],
+        },
+        legal: {
+          summary: 'test',
+          license: 'test',
+          notes: [],
+          sources: [],
+        },
+      },
+      {
+        outputRoot,
+        debug: true,
+        debugRoot,
+        dryRun: false,
+        requestTimeoutMs: 5000,
+      },
+    );
+
+    const progressPath = path.join(outputRoot, 'demo-seoul-open-api-debug', manifest.runId, 'OA-DEMO-LOCALDATA_DEMO.progress.json');
+    const progress = JSON.parse(await fs.readFile(progressPath, 'utf8'));
+    assert.match(progress.debugLogPath, /debug\.log$/i);
+    assert.match(progress.debugDir, /demo-seoul-open-api-debug/i);
+
+    const debugDir = path.join(debugRoot, 'demo-seoul-open-api-debug', manifest.runId);
+    const meta = JSON.parse(await fs.readFile(path.join(debugDir, 'meta.json'), 'utf8'));
+    const logText = await fs.readFile(path.join(debugDir, 'debug.log'), 'utf8');
+
+    assert.equal(meta.status, 'completed');
+    assert.match(logText, /Open API spec OA-DEMO/);
+    assert.match(logText, /fetch\.response\.headers/);
+    assert.match(logText, /page 1-1000 -> received 2 rows/);
   } finally {
     global.fetch = originalFetch;
 
